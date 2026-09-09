@@ -316,6 +316,8 @@ build/
 /gsd-core/bin/lib/task-content-resolution.cjs
 __pycache__/
 *.pyc
+.gsd-auto/
+*.egg-info/
 .venv/
 venv/
 target/

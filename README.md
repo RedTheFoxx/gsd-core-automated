@@ -39,6 +39,9 @@ Each milestone repeats the same five-step loop, one phase at a time:
 
 ## Quickstart
 
+For non-interactive execution from Python with an OpenAI-compatible endpoint and
+a rules-driven user representative, see [Autonomous Python host](AUTOMATION.md).
+
 ```bash
 npx @opengsd/gsd-core@latest
 ```

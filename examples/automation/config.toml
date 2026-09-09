@@ -1,0 +1,30 @@
+# Paths are relative to this configuration file.
+workspace = "../../tmp/gsd-demo"
+gsd_root = "../.."
+rules_file = "rules.toml"
+prompt = "Construire une CLI Python de liste de tâches avec ajout, liste et suppression, stockage JSON local et tests automatisés."
+
+[llm]
+base_url = "http://localhost:8000/v1"
+model = "your-tool-capable-model"
+api_key_env = "OPENAI_API_KEY"
+# decision_model = "another-model"  # Same endpoint; defaults to model.
+# [llm.agent_models]
+# gsd-executor = "coding-model"
+# [llm.request_options]
+# max_tokens = 8192
+
+[runtime]
+shell = "bash"
+# Windows with Git for Windows:
+# shell = "C:/Program Files/Git/bin/bash.exe"
+node = "node"
+allow_shell = true
+max_calls = 300
+max_steps = 100
+max_depth = 3
+max_context_chars = 300000
+timeout = 120
+command_timeout = 120
+# Use acceptance commands appropriate to YOUR project. Nonzero exit rejects completion.
+verification_commands = ["python -m unittest discover -s tests -v"]
