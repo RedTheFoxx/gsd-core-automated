@@ -29,6 +29,12 @@ class Config:
     max_steps: int = 100
     max_depth: int = 3
     max_context_chars: int = 300000
+    compact_trigger_ratio: float = 0.8
+    compact_target_ratio: float = 0.5
+    reconnect_attempts: int = 30
+    reconnect_timeout: int = 900
+    retry_initial_delay: float = 1
+    retry_max_delay: float = 30
     timeout: int = 120
     command_timeout: int = 120
     shell: str = "bash"
@@ -76,9 +82,13 @@ class Config:
         parsed = urlparse(cfg.base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError("base_url must be an HTTP(S) API base URL without credentials/query")
-        for key in ("max_calls", "max_steps", "max_depth", "max_context_chars", "timeout", "command_timeout"):
+        for key in ("max_calls", "max_steps", "max_depth", "max_context_chars", "timeout", "command_timeout", "reconnect_attempts", "reconnect_timeout"):
             if type(getattr(cfg, key)) is not int or getattr(cfg, key) < 1:
                 raise ValueError(f"{key} must be a positive integer")
+        if not 0 < cfg.compact_target_ratio < cfg.compact_trigger_ratio < 1:
+            raise ValueError("Require 0 < compact_target_ratio < compact_trigger_ratio < 1")
+        if not 0 < cfg.retry_initial_delay <= cfg.retry_max_delay:
+            raise ValueError("Require 0 < retry_initial_delay <= retry_max_delay")
         if {"messages", "tools", "model", "stream", "tool_choice"} & cfg.request_options.keys():
             raise ValueError("request_options cannot override model/messages/tools/stream/tool_choice")
         if not isinstance(cfg.allow_shell, bool):

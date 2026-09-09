@@ -71,6 +71,54 @@ sur cet endpoint. `llm.request_options` passe des options fournisseur additionne
 sans pouvoir remplacer les messages ou les outils. Les requêtes 429/5xx réessayées
 comptent dans le budget global, partagé entre tous les rôles.
 
+## Coupures réseau et compaction automatique
+
+Une perte de connexion au fournisseur (VPN, timeout, connexion réinitialisée,
+réponse HTTP coupée) déclenche automatiquement une nouvelle tentative de la
+**même requête LLM**, avec les mêmes messages et résultats d'outils. Aucun prompt
+« resume » ou « continue » humain n'est nécessaire tant que le programme tourne
+et que la connexion revient dans les limites configurées. HTTP 408, 429 et les
+erreurs temporaires 500/502/503/504 sont aussi réessayés. Une erreur de clé ou de
+configuration (par exemple 401/403) arrête explicitement le programme.
+
+Les tentatives attendent 1, 2, 4… secondes, puis au maximum 30 secondes entre
+elles, sauf `Retry-After` plus long demandé par le serveur. Limites par requête :
+30 tentatives et 900 secondes, configurables avec `reconnect_attempts`,
+`reconnect_timeout`, `retry_initial_delay`, `retry_max_delay`. Le budget global
+`max_calls` reste applicable. La console et la trace signalent l'interruption
+et le retour de connexion. Le transport est non-streaming : une réponse partielle
+n'est jamais utilisée pour exécuter un outil. Une requête LLM réessayée peut
+cependant être facturée plusieurs fois par le fournisseur.
+
+La reprise réseau reste à l'intérieur de l'appel LLM : elle ne relance ni les
+scripts déjà terminés, ni les sous-agents déjà revenus, ni les contrôles
+d'acceptation déjà exécutés avant cet appel. Les sous-agents, le représentant,
+le résumeur et le réviseur bénéficient du même mécanisme.
+
+Avant un appel LLM, le wrapper vérifie la taille du contexte et des définitions
+d'outils. À 80 % de `max_context_chars`, il résume les tours anciens avec le modèle
+du rôle courant et vise 50 % du budget. Les paramètres sont
+`compact_trigger_ratio` et `compact_target_ratio`. Il conserve les instructions
+système, un résumé de travail (tâche, décisions, actions effectuées, fichiers,
+tests, questions et prochaines étapes) et les échanges récents complets.
+Un appel d'outil et ses résultats ne sont jamais séparés. Le programme continue
+ensuite automatiquement, sans réinitialiser ses budgets ni sa pile de sous-agents.
+
+La mesure est en **caractères**, avec une marge configurable, pas en tokens :
+elle reste indépendante du tokenizer du fournisseur. Si celui-ci refuse malgré
+tout le contexte (`context_length_exceeded` ou message reconnu équivalent), le
+wrapper compacte davantage et réessaie jusqu'à trois fois. Les longs historiques
+sont résumés par fragments. Les appels de résumé utilisent les mêmes budgets
+et la même reconnexion. Une compaction impossible (instructions immuables trop
+longues, résumé invalide ou trop long) provoque une erreur explicite ; elle ne
+détruit pas l'historique initial. La qualité du résumé dépend du modèle.
+
+Avant chaque requête, un checkpoint `session-<id>.json` est écrit atomiquement
+dans le répertoire de l'exécution. Avant chaque compaction, le contexte complet
+est conservé dans `context-<id>.json`. L'agent reçoit le chemin de cette archive
+pour retrouver les détails nécessaires. Ces fichiers peuvent contenir du code
+et des données du projet, comme la trace.
+
 ## Outils et portée de cette version
 
 `Read` (pagination en caractères), `Write`, `Edit` (occurrence unique), `Glob`,
@@ -112,8 +160,9 @@ gsd-auto --config examples/automation/config.toml --resume
 python -m unittest discover -s tests_python -v
 ```
 
-La reprise crée une nouvelle conversation à partir des fichiers GSD et des
-décisions enregistrées. Elle n'est pas une reprise exacte de pile ni une garantie
+La reprise après arrêt du programme crée une nouvelle conversation à partir des
+fichiers GSD, des décisions enregistrées et des chemins des checkpoints du dernier
+run correspondant au même besoin. Elle n'est pas une reprise exacte de pile ni une garantie
 « exactement une fois » pour les commandes interrompues. Le LLM doit examiner
 les modifications partielles avant de réessayer. Conserver le même besoin et les
 mêmes règles pour une reprise cohérente.
@@ -126,15 +175,21 @@ exécution incomplète en succès.
 
 ## Validation de cette version
 
-18 tests couvrent notamment le protocole HTTP Chat Completions, les questions
+Les tests couvrent notamment le protocole HTTP Chat Completions, les questions
 structurées et libres, les règles, les contextes de sous-agents, les erreurs
 d'outils, les délais de processus, les budgets, le verrou, la reprise et la
-validation finale. Un test lance la vraie CLI Python avec un endpoint simulé,
+validation finale, les reconnexions après coupure, les limites de reconnexion,
+la compaction répétée et les refus de contexte du fournisseur. Un test lance la vraie CLI Python avec un endpoint simulé,
 le corpus GSD du dépôt, `query init.new-project`, Git Bash, Node, un sous-agent
 qui écrit un fichier et une commande d'acceptation réelle. Ce test nécessite
 la compilation préalable de GSD ; sinon il est explicitement ignoré.
 
-La compilation complète de GSD et ces 18 tests ont réussi sous Windows.
+Un autre serveur de test coupe réellement la connexion après une écriture :
+la requête est réémise avec son résultat d'outil et l'écriture ne se produit
+qu'une fois. Les tests de compaction vérifient aussi les groupes d'appels
+d'outils multiples, les archives et la conservation de l'original en cas d'échec.
+
+La compilation complète de GSD et la suite de tests ont réussi sous Windows.
 Aucun parcours avec un vrai LLM n'a été effectué : la qualité du suivi autonome
 de toutes les phases et la compatibilité d'un fournisseur particulier restent
 à valider sur le modèle choisi.

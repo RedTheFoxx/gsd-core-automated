@@ -24,6 +24,12 @@ max_calls = 300
 max_steps = 100
 max_depth = 3
 max_context_chars = 300000
+compact_trigger_ratio = 0.8
+compact_target_ratio = 0.5
+reconnect_attempts = 30
+reconnect_timeout = 900
+retry_initial_delay = 1
+retry_max_delay = 30
 timeout = 120
 command_timeout = 120
 # Use acceptance commands appropriate to YOUR project. Nonzero exit rejects completion.
