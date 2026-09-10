@@ -2,6 +2,7 @@
 import json
 import http.client
 import os
+import threading
 import time
 from email.utils import parsedate_to_datetime
 import urllib.error
@@ -20,6 +21,7 @@ CONTEXT_MARKERS = ("context_length_exceeded", "maximum context length", "context
 RETRIABLE_CODES = {"408", "429", "500", "502", "503", "504"}
 MAX_OUTPUT_TOKENS = 131072
 MAX_LENGTH_RETRIES = 3
+HEARTBEAT_SECONDS = 30
 
 
 class Client:
@@ -45,6 +47,22 @@ class Client:
             headers["Authorization"] = f"Bearer {key}"
         started = time.monotonic()
         deadline = started + cfg.reconnect_timeout
+        chars = len(json.dumps(payload))
+        stop = threading.Event()
+        threading.Thread(target=self._heartbeat, args=(stop, started, payload["model"], chars), daemon=True).start()
+        try:
+            return self._attempts(payload, headers, started, deadline)
+        finally:
+            stop.set()
+
+    def _heartbeat(self, stop, started, model, chars):
+        # A non-streaming call shows nothing until the whole answer arrives;
+        # report the wait so a long generation is not mistaken for a stall.
+        while not stop.wait(HEARTBEAT_SECONDS):
+            self.on_event("model_waiting", model=model, seconds=int(time.monotonic() - started), chars=chars)
+
+    def _attempts(self, payload, headers, started, deadline):
+        cfg = self.config
         truncations = 0
         for attempt in range(cfg.reconnect_attempts):
             if time.monotonic() >= deadline:

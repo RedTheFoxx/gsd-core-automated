@@ -84,9 +84,11 @@ Une réponse tronquée (`finish_reason: "length"`) est réémise avec un
 Chaque événement est aussi affiché en direct sur stderr : sessions et
 sous-agents, appels d'outils avec un aperçu des arguments, résumés de résultats,
 décisions du représentant, tokens consommés par appel (`USAGE`, total cumulé),
-reconnexions, compactions et revue finale. `runtime.console = false` ou
-`--quiet` désactive cet affichage ; `events.jsonl` reste complet dans tous les
-cas.
+reconnexions, compactions et revue finale. Le transport étant non-streaming,
+une ligne `WAIT <modèle> <secondes>s` apparaît toutes les 30 s pendant un appel
+en vol : un silence prolongé est donc une génération longue, pas un blocage.
+`runtime.console = false` ou `--quiet` désactive cet affichage ; `events.jsonl`
+reste complet dans tous les cas.
 
 ## Exécution et décisions
 

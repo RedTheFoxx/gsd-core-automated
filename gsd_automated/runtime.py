@@ -105,6 +105,8 @@ class Runtime:
             if data.get("prompt_tokens") is None and data.get("completion_tokens") is None:
                 return
             line = f"USAGE in={data.get('prompt_tokens')} out={data.get('completion_tokens')} total={self.tokens}"
+        elif event == "model_waiting":
+            line = f"WAIT {data.get('model')} {data.get('seconds')}s in flight (req {data.get('chars', 0) // 1000}k chars)"
         elif event == "tool_start":
             line = f"-> {data.get('name')} {data.get('preview', '')}"
         elif event == "tool_result":

@@ -137,6 +137,17 @@ class TransportTests(Fixture):
         self.assertIn("response_truncated", events)
         self.assertEqual(events.count("model_usage"), 3)
 
+    def test_heartbeat_reports_waiting_calls(self):
+        def urlopen(request, **kwargs):
+            threading.Event().wait(0.05)
+            return io.BytesIO(json.dumps({"choices": [{"message": say("ok"), "finish_reason": "stop"}]}).encode())
+        events = []
+        client = Client(self.cfg)
+        client.on_event = lambda event, **data: events.append(event)
+        with patch("gsd_automated.client.HEARTBEAT_SECONDS", 0.01), patch("urllib.request.urlopen", side_effect=urlopen):
+            client.complete([say("hi")])
+        self.assertIn("model_waiting", events)
+
     def test_length_beyond_ceiling_still_fails(self):
         def urlopen(request, **kwargs):
             return io.BytesIO(json.dumps({"choices": [{"message": say("x"), "finish_reason": "length"}]}).encode())
