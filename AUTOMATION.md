@@ -149,9 +149,12 @@ elle reste indépendante du tokenizer du fournisseur. Si celui-ci refuse malgré
 tout le contexte (`context_length_exceeded` ou message reconnu équivalent), le
 wrapper compacte davantage et réessaie jusqu'à trois fois. Les longs historiques
 sont résumés par fragments. Les appels de résumé utilisent les mêmes budgets
-et la même reconnexion. Une compaction impossible (instructions immuables trop
-longues, résumé invalide ou trop long) provoque une erreur explicite ; elle ne
-détruit pas l'historique initial. La qualité du résumé dépend du modèle.
+et la même reconnexion. Un résumé trop long est d'abord re-compressé par le
+modèle, puis tronqué en conservant début (tâche, décisions) et fin (prochaine
+étape) avec un marqueur vers l'archive : jamais d'arrêt pour un dépassement de
+longueur. Une compaction impossible (instructions immuables trop longues,
+résumé vide ou invalide) provoque une erreur explicite ; elle ne détruit pas
+l'historique initial. La qualité du résumé dépend du modèle.
 
 Avant chaque requête, un checkpoint `session-<id>.json` est écrit atomiquement
 dans le répertoire de l'exécution. Avant chaque compaction, le contexte complet
