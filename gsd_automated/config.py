@@ -41,6 +41,7 @@ class Config:
     shell: str = "bash"
     node: str = "node"
     allow_shell: bool = True
+    console: bool = True
     verification_commands: list = field(default_factory=list)
 
     @property
@@ -106,8 +107,8 @@ class Config:
             raise ValueError("Require 0 < retry_initial_delay <= retry_max_delay")
         if {"messages", "tools", "model", "stream", "tool_choice"} & cfg.request_options.keys():
             raise ValueError("request_options cannot override model/messages/tools/stream/tool_choice")
-        if not isinstance(cfg.allow_shell, bool):
-            raise ValueError("allow_shell must be boolean")
+        if not isinstance(cfg.allow_shell, bool) or not isinstance(cfg.console, bool):
+            raise ValueError("allow_shell and console must be boolean")
         if not cfg.allow_shell:
             raise ValueError("This GSD host requires allow_shell=true for its Node utilities and scripts")
         return cfg

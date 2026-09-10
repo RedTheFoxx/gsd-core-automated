@@ -7,6 +7,7 @@ import signal
 import sys
 import subprocess
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -67,6 +68,11 @@ text. Resolve your own questions with AskUserQuestion before returning.
 """
 
 
+def cut(value, limit=160):
+    text = " ".join(str(value).split())
+    return text if len(text) <= limit else text[:limit - 1] + "..."
+
+
 class Runtime:
     def __init__(self, cfg, client):
         self.cfg, self.client = cfg, client
@@ -74,15 +80,89 @@ class Runtime:
         self.run_id = uuid.uuid4().hex
         self.log_dir = self.workspace / ".gsd-auto" / self.run_id
         self.decisions = []
-        self.client.on_event = self.connection_event
+        self.client.on_event = self.emit
         self.compactor = Compactor(client, self.archive_context, self.emit)
+        self.agents = {}
+        self.tokens = 0
 
-    def connection_event(self, event, **data):
-        self.emit(event, **data)
-        if event == "connection_retry":
-            print(f"LLM connection interrupted; retry {data['attempt']} in {data['delay_seconds']:g}s", file=sys.stderr)
+    def report(self, event, **data):
+        """Live console overlay: one line per event, stderr so stdout stays JSON."""
+        if not self.cfg.console:
+            return
+        agent = self.agents.get(data.get("session"), "host")
+        if event == "run_start":
+            line = f"START need=\"{cut(data.get('initial_need', ''), 120)}\"" + (" (resume)" if data.get("resume") else "")
+        elif event == "session_start":
+            self.agents[data.get("session")] = data.get("agent")
+            line = f"SESSION {data.get('agent')} depth={data.get('depth')}"
+        elif event == "assistant":
+            message = data.get("message", {})
+            calls = message.get("tool_calls") or []
+            names = ", ".join(str(c.get("function", {}).get("name")) for c in calls)
+            line = f"MODEL -> {names}" if names else f"MODEL \"{cut(message.get('content') or '(empty)')}\""
+        elif event == "model_usage":
+            self.tokens += (data.get("prompt_tokens") or 0) + (data.get("completion_tokens") or 0)
+            if data.get("prompt_tokens") is None and data.get("completion_tokens") is None:
+                return
+            line = f"USAGE in={data.get('prompt_tokens')} out={data.get('completion_tokens')} total={self.tokens}"
+        elif event == "tool_start":
+            line = f"-> {data.get('name')} {data.get('preview', '')}"
+        elif event == "tool_result":
+            line = f"<- {data.get('name')} {self._summary(data.get('result'))}"
+        elif event == "decision":
+            line = f"DECIDE[{data.get('source')}] {cut(data.get('question'), 80)} -> {cut(data.get('answer'), 80)}"
+        elif event == "connection_retry":
+            line = f"RETRY {data.get('attempt')} in {data.get('delay_seconds'):g}s ({data.get('reason')})"
         elif event == "connection_restored":
-            print("LLM connection restored; continuing pending request", file=sys.stderr)
+            line = f"RESTORED after {data.get('attempts')} attempts"
+        elif event == "response_truncated":
+            line = f"TRUNCATED output; retrying with max_tokens={data.get('max_tokens')}"
+        elif event == "context_compacted":
+            line = f"COMPACT {data.get('before_chars')}->{data.get('after_chars')} chars"
+        elif event == "context_summary_trimmed":
+            line = f"SUMMARY TRIMMED {data.get('before_chars')}->{data.get('after_chars')} chars"
+        elif event == "completion_review":
+            line = f"REVIEW {cut(data.get('verdict'), 160)}"
+        elif event == "run_end":
+            line = f"END {data.get('status')} - {cut(data.get('summary'), 160)}"
+        elif event in {"error", "interrupted"}:
+            line = f"{event.upper()} {cut(data.get('message', ''))}"
+        else:
+            return
+        print(f"[{time.strftime('%H:%M:%S')}] {agent} | {line}", file=sys.stderr)
+
+    def _summary(self, result):
+        if isinstance(result, dict):
+            if "error" in result:
+                return "ERROR " + cut(result["error"])
+            if "written" in result:
+                return "wrote " + cut(result["written"], 100)
+            if "exit_code" in result:
+                return f"exit {result['exit_code']}" + (" TIMEOUT" if result.get("timed_out") else "") + " " + cut(result.get("output", ""), 80)
+            if "matches" in result:
+                return f"{len(result['matches'])} matches"
+            if "status" in result:
+                return str(result["status"])
+            if "result" in result:
+                return cut(result["result"])
+            if "content" in result:
+                return f"{result.get('total_chars') or len(result['content'])} chars"
+        return cut(json.dumps(result, ensure_ascii=False))
+
+    def _preview(self, name, raw):
+        try:
+            args = json.loads(raw) if isinstance(raw, str) else {}
+        except ValueError:
+            args = {}
+        if isinstance(args, dict):
+            if name == "GSD" and isinstance(args.get("args"), list):
+                return cut(" ".join(args["args"]), 100)
+            if name == "AskUserQuestion" and isinstance(args.get("questions"), list):
+                return f"{len(args['questions'])} question(s): {cut(args['questions'][0], 80)}" if args["questions"] else ""
+            for key in ("path", "command", "agent_type", "pattern", "status"):
+                if key in args:
+                    return cut(args[key], 100)
+        return cut(raw, 100)
 
     def snapshot(self, name, data):
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -133,6 +213,10 @@ class Runtime:
             encoded = encoded.replace(key, "[REDACTED]")
         with (self.log_dir / "events.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(encoded + "\n")
+        try:
+            self.report(event, **data)
+        except Exception:
+            pass
 
     def path(self, raw, write=False):
         raw = raw.lstrip("@").replace("\\", "/")
@@ -224,6 +308,8 @@ class Runtime:
     def preflight(self):
         if not self.workspace.is_dir():
             raise RunError("Workspace must already exist")
+        if self.cfg.is_openrouter and not os.getenv(self.cfg.api_key_env):
+            raise RunError(f"{self.cfg.api_key_env} is not set; OpenRouter requires an API key (new terminals inherit it)")
         for item in ["commands/gsd/new-project.md", "commands/gsd/progress.md", "agents/gsd-executor.md", "gsd-core/bin/gsd-tools.cjs"]:
             if not (self.root / item).is_file():
                 raise RunError(f"GSD root missing {item}")
@@ -379,7 +465,7 @@ class Runtime:
                 seen.add(call["id"])
             for call in calls:
                 name = call["function"].get("name")
-                self.emit("tool_start", session=sid, name=name, call_id=call["id"])
+                self.emit("tool_start", session=sid, name=name, call_id=call["id"], preview=self._preview(name, call["function"].get("arguments", "")))
                 try:
                     args = json.loads(call["function"].get("arguments", ""))
                     if not isinstance(args, dict):

@@ -1,3 +1,4 @@
+import contextlib
 import http.client
 import io
 import json
@@ -118,6 +119,54 @@ class TransportTests(Fixture):
         self.assertIn("http-referer", headers)
         echoed = json.loads(sent[1].data)["messages"][1]
         self.assertEqual(echoed["reasoning_details"], reply["reasoning_details"])
+
+    def test_length_escalates_max_tokens_then_recovers(self):
+        self.cfg.request_options = {"max_tokens": 100}
+        sent = []
+        def urlopen(request, **kwargs):
+            sent.append(json.loads(request.data))
+            reason = "stop" if len(sent) == 3 else "length"
+            return io.BytesIO(json.dumps({"choices": [{"message": say("ok"), "finish_reason": reason}],
+                                          "usage": {"prompt_tokens": 10, "completion_tokens": 5}}).encode())
+        events = []
+        client = Client(self.cfg)
+        client.on_event = lambda event, **data: events.append(event)
+        with patch("urllib.request.urlopen", side_effect=urlopen), patch("time.sleep"):
+            self.assertEqual(client.complete([say("hi")])["content"], "ok")
+        self.assertEqual([r["max_tokens"] for r in sent], [100, 200, 400])
+        self.assertIn("response_truncated", events)
+        self.assertEqual(events.count("model_usage"), 3)
+
+    def test_length_beyond_ceiling_still_fails(self):
+        def urlopen(request, **kwargs):
+            return io.BytesIO(json.dumps({"choices": [{"message": say("x"), "finish_reason": "length"}]}).encode())
+        with patch("urllib.request.urlopen", side_effect=urlopen), patch("time.sleep"):
+            with self.assertRaisesRegex(RunError, "length"):
+                Client(self.cfg).complete([say("hi")])
+
+
+class ConsoleTests(Fixture):
+    def test_console_reports_actions_live(self):
+        runtime = self.runtime(
+            tool("Write", {"path": "a.txt", "content": "x"}),
+            tool("Finish", {"status": "blocked", "summary": "stop here", "evidence": []}))
+        stream = io.StringIO()
+        with contextlib.redirect_stderr(stream):
+            runtime.session("start")
+        out = stream.getvalue()
+        self.assertIn("SESSION root", out)
+        self.assertIn("-> Write", out)
+        self.assertIn("a.txt", out)
+        self.assertIn("<- Write", out)
+        self.assertIn("END blocked", out)
+
+    def test_quiet_disables_console(self):
+        self.cfg.console = False
+        runtime = self.runtime(tool("Finish", {"status": "blocked", "summary": "s", "evidence": []}))
+        stream = io.StringIO()
+        with contextlib.redirect_stderr(stream):
+            runtime.session("start")
+        self.assertEqual(stream.getvalue(), "")
 
     def test_real_disconnect_after_tool_does_not_reexecute_tool(self):
         requests = []
@@ -249,6 +298,23 @@ class CompactionTests(Fixture):
         self.assertEqual(runtime.complete(messages)["content"], "recovered")
         self.assertEqual(model.generations, 2)
         self.assertLess(size(messages), 12000)
+
+    def test_oversized_summary_is_repaired_or_trimmed_not_fatal(self):
+        oversized = say("Task preserved. " + "detail " * 3000)  # ~21k chars > summary_limit
+        repaired = say("Task and decisions preserved. Next: implement.")
+        # Two chunks: normal merge, then oversized -> repaired by one model pass.
+        runtime = self.runtime(say("Chunk one summarized."), oversized, repaired)
+        messages = self.history()
+        runtime.compactor.compact(messages, 30000, "test-model")
+        self.assertLess(size(messages), 30000)
+        self.assertIn("Task and decisions preserved", messages[1]["content"])
+        # A doubly-oversized reply falls back to a head/tail trim, never fatal.
+        runtime = self.runtime(say("Chunk one summarized."), oversized, oversized)
+        messages = self.history()
+        runtime.compactor.compact(messages, 30000, "test-model")
+        self.assertLess(size(messages), 30000)
+        self.assertIn("characters trimmed", messages[1]["content"])
+        self.assertLess(len(messages[1]["content"]), 16000)
 
     def test_failed_summary_leaves_original_intact(self):
         runtime = self.runtime(say(""))

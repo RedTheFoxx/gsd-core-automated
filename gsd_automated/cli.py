@@ -16,10 +16,13 @@ def main(argv=None):
     parser.add_argument("--gsd-root", help="GSD checkout/package root containing commands, agents and gsd-core")
     parser.add_argument("--check", action="store_true", help="Validate configuration and local runtime, without calling the LLM")
     parser.add_argument("--resume", action="store_true", help="Start a fresh context from existing GSD state and previous decisions")
+    parser.add_argument("--quiet", action="store_true", help="Disable the live console progress overlay")
     args = parser.parse_args(argv)
     runtime = None
     try:
         cfg = Config.load(args)
+        if args.quiet:
+            cfg.console = False
         runtime = Runtime(cfg, Client(cfg))
         if args.check:
             runtime.preflight()

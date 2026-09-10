@@ -18,6 +18,8 @@ class ContextWindowError(RunError):
 
 CONTEXT_MARKERS = ("context_length_exceeded", "maximum context length", "context window", "too many tokens", "prompt is too long")
 RETRIABLE_CODES = {"408", "429", "500", "502", "503", "504"}
+MAX_OUTPUT_TOKENS = 131072
+MAX_LENGTH_RETRIES = 3
 
 
 class Client:
@@ -43,6 +45,7 @@ class Client:
             headers["Authorization"] = f"Bearer {key}"
         started = time.monotonic()
         deadline = started + cfg.reconnect_timeout
+        truncations = 0
         for attempt in range(cfg.reconnect_attempts):
             if time.monotonic() >= deadline:
                 raise RunError("Reconnection deadline exhausted; state is preserved")
@@ -66,8 +69,23 @@ class Client:
                     reason, retry_after = f"provider error {fault.get('code')}", None
                 else:
                     choice = data["choices"][0]
-                    if choice.get("finish_reason") in {"length", "content_filter"}:
-                        raise RunError(f"Incomplete model response: {choice['finish_reason']}")
+                    usage = data.get("usage") or {}
+                    self.on_event("model_usage", model=payload["model"],
+                                  prompt_tokens=usage.get("prompt_tokens"),
+                                  completion_tokens=usage.get("completion_tokens"))
+                    # A truncated answer is discarded but billed. Resend the same
+                    # request with a larger output budget instead of failing.
+                    if choice.get("finish_reason") == "length":
+                        current = payload.get("max_tokens")
+                        current = current if isinstance(current, int) else 8192
+                        if truncations < MAX_LENGTH_RETRIES and current < MAX_OUTPUT_TOKENS:
+                            truncations += 1
+                            payload["max_tokens"] = min(current * 2, MAX_OUTPUT_TOKENS)
+                            self.on_event("response_truncated", max_tokens=payload["max_tokens"])
+                            continue
+                        raise RunError("Incomplete model response: length")
+                    if choice.get("finish_reason") == "content_filter":
+                        raise RunError("Incomplete model response: content_filter")
                     message = choice["message"]
                     if message.get("role") != "assistant":
                         raise RunError("Endpoint returned a non-assistant message")

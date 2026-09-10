@@ -50,7 +50,7 @@ class Compactor:
         if not groups:
             raise RunError("No older context can be compacted within the configured budget")
         path = self.archive(messages)
-        summary_limit = min(12000, (room - tail_size) // 2)
+        summary_limit = min(30000, (room - tail_size) // 2)
         transcript = "\n".join(json.dumps(m, ensure_ascii=False) for group in groups for m in group)
         summary = ""
         offset = 0
@@ -77,8 +77,7 @@ class Compactor:
             if response.get("tool_calls") or not isinstance(value, str) or not value.strip():
                 raise RunError("Compaction must return a non-empty text handoff")
             if len(value) > summary_limit:
-                # Do not silently truncate away a task, decision or pending action.
-                raise RunError("Compaction summary exceeds its requested budget; original context was archived")
+                value = self.fit_summary(value, summary_limit, model)
             summary = value
             offset += len(chunk)
         memory = {"role": "user", "content":
@@ -91,3 +90,28 @@ class Compactor:
             raise RunError("Compaction did not fit the target budget; original context was archived")
         self.emit("context_compacted", before_chars=original_size, after_chars=size(candidate), archive=str(path))
         messages[:] = candidate
+
+    def fit_summary(self, value, limit, model):
+        """An oversized handoff gets one model repair pass, then a hard trim.
+        Compaction must not fail just because a summary ran a little long."""
+        try:
+            response = self.client.complete([
+                {"role": "system", "content":
+                 f"Rewrite the following GSD handoff to at most {limit} characters. Preserve the "
+                 "assigned task, active workflow/phase and exact next step, decisions, file paths, "
+                 "completed tool effects, test results and unresolved blockers. "
+                 "Return only the compressed handoff."},
+                {"role": "user", "content": value}], model=model)
+            fixed = response.get("content")
+            if not response.get("tool_calls") and isinstance(fixed, str) and fixed.strip() and len(fixed) <= limit:
+                return fixed
+        except RunError:
+            pass
+        # Last resort: keep the head (task, decisions) and the tail (next steps).
+        keep = limit - 80
+        head = keep * 2 // 3
+        trimmed = (value[:head] +
+                   f"\n[...{len(value) - keep} characters trimmed; full transcript in the archive...]\n" +
+                   value[len(value) - (keep - head):])
+        self.emit("context_summary_trimmed", before_chars=len(value), after_chars=len(trimmed))
+        return trimmed
