@@ -293,6 +293,25 @@ class ConfigTests(unittest.TestCase):
             args.prompt = "Override"
             self.assertEqual(Config.load(args).prompt, "Override")
 
+    def test_openrouter_env_resolution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "rules.json").write_text(json.dumps({"instructions": "simple"}))
+            (root / "config.json").write_text(json.dumps({"prompt": "p", "rules_file": "rules.json"}))
+            args = argparse.Namespace(config=str(root / "config.json"), prompt=None, rules=None, workspace=None, gsd_root=None, check=False)
+            env = {"OPENAI_API_KEY": "", "OPENAI_BASE_URL": "", "OPENAI_MODEL": "", "OPENROUTER_BASE_URL": "",
+                   "OPENROUTER_API_KEY": "sk-or", "OPENROUTER_MODEL": "vendor/model"}
+            with patch.dict(os.environ, env):
+                cfg = Config.load(args)
+            self.assertEqual(cfg.base_url, "https://openrouter.ai/api/v1")
+            self.assertEqual(cfg.api_key_env, "OPENROUTER_API_KEY")
+            self.assertEqual(cfg.model, "vendor/model")
+            env.update({"OPENAI_API_KEY": "sk-only", "OPENROUTER_API_KEY": "", "OPENROUTER_MODEL": "", "OPENAI_MODEL": "local-model"})
+            with patch.dict(os.environ, env):
+                cfg = Config.load(args)
+            self.assertEqual(cfg.base_url, "http://localhost:8000/v1")
+            self.assertEqual(cfg.api_key_env, "OPENAI_API_KEY")
+
 
 if __name__ == "__main__":
     unittest.main()

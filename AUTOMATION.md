@@ -48,6 +48,32 @@ absent produit une erreur immédiate. JSON est également accepté pour la confi
 et les règles. Sans config : fournir `--rules`, `--workspace`, `--gsd-root`, puis
 `OPENAI_BASE_URL`, `OPENAI_MODEL` et `--prompt`.
 
+### Endpoint OpenRouter
+
+Le transport Chat Completions fonctionne avec OpenRouter :
+
+```toml
+[llm]
+base_url = "https://openrouter.ai/api/v1"
+model = "anthropic/claude-sonnet-4"   # Identifiant fournisseur/modèle, ou "openrouter/auto"
+```
+
+Choisir un modèle dont la fiche OpenRouter indique la prise en charge des outils
+(tool calling). La clé est lue depuis `OPENROUTER_API_KEY` : sur l'hôte
+openrouter.ai cette variable est sélectionnée automatiquement quand
+`api_key_env` n'est pas configuré et que `OPENAI_API_KEY` n'est pas définie.
+`OPENROUTER_BASE_URL` et `OPENROUTER_MODEL` servent de variables de secours après
+`OPENAI_BASE_URL` et `OPENAI_MODEL` ; si seule `OPENROUTER_API_KEY` est présente,
+`base_url` vaut l'endpoint OpenRouter par défaut. Les en-têtes d'attribution
+`HTTP-Referer` et `X-Title` sont envoyés avec des valeurs par défaut, remplaçables
+via `[llm.headers]` qui accepte tout en-tête additionnel. `llm.request_options`
+accepte les champs OpenRouter (`provider` pour le routage, `transforms`,
+`reasoning`, etc.) sauf les clés réservées aux messages et aux outils. Les champs
+`reasoning`/`reasoning_details` des réponses sont conservés et renvoyés à la
+requête suivante, exigence des modèles à raisonnement avec appels d'outils.
+Une erreur fournisseur relayée dans un corps HTTP 200 suit la même
+classification qu'une erreur de transport (réessai, compaction ou arrêt).
+
 ## Exécution et décisions
 
 1. Le contrôle local vérifie le corpus, Git, Node, Bash et l'identité du runtime GSD.

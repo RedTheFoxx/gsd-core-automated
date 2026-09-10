@@ -1,6 +1,7 @@
 import http.client
 import io
 import json
+import os
 import socket
 import tempfile
 import threading
@@ -79,6 +80,44 @@ class TransportTests(Fixture):
             with self.assertRaises(ContextWindowError):
                 Client(self.cfg).complete([say("hello")])
         sleep.assert_not_called()
+
+    def test_in_body_provider_error_classification(self):
+        # OpenRouter can relay an upstream failure inside an HTTP 200 body.
+        def body(error):
+            return io.BytesIO(json.dumps({"error": error}).encode())
+        with patch("urllib.request.urlopen", side_effect=[body({"code": 429, "message": "rate limited"}), self.success()]) as urlopen, patch("time.sleep"):
+            Client(self.cfg).complete([say("hello")])
+        self.assertEqual(urlopen.call_count, 2)
+        with patch("urllib.request.urlopen", side_effect=[body({"code": 402, "message": "Insufficient credits"})]), patch("time.sleep") as sleep:
+            with self.assertRaisesRegex(RunError, "Insufficient credits"):
+                Client(self.cfg).complete([say("hello")])
+        sleep.assert_not_called()
+        with patch("urllib.request.urlopen", side_effect=[body({"code": 400, "message": "This endpoint's maximum context length is 8 tokens"})]):
+            with self.assertRaises(ContextWindowError):
+                Client(self.cfg).complete([say("hello")])
+
+    def test_openrouter_headers_and_reasoning_details_echoed(self):
+        self.cfg.base_url = "https://openrouter.ai/api/v1"
+        self.cfg.api_key_env = "OPENROUTER_API_KEY"
+        self.cfg.headers = {"X-Title": "fixture-app"}
+        sent = []
+        reply = tool("Write", {"path": "a.txt", "content": "x"})
+        reply["reasoning_details"] = [{"type": "reasoning.text", "text": "plan"}]
+        def urlopen(request, **kwargs):
+            sent.append(request)
+            message = reply if len(sent) == 1 else say("done")
+            return io.BytesIO(json.dumps({"choices": [{"message": message, "finish_reason": "stop"}]}).encode())
+        with patch("urllib.request.urlopen", side_effect=urlopen), patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-key"}):
+            client = Client(self.cfg)
+            first = client.complete([say("start")])
+            self.assertEqual(first["reasoning_details"], reply["reasoning_details"])
+            client.complete([say("start"), first])
+        headers = {name.lower(): value for name, value in sent[0].headers.items()}
+        self.assertEqual(headers["authorization"], "Bearer sk-or-key")
+        self.assertEqual(headers["x-title"], "fixture-app")
+        self.assertIn("http-referer", headers)
+        echoed = json.loads(sent[1].data)["messages"][1]
+        self.assertEqual(echoed["reasoning_details"], reply["reasoning_details"])
 
     def test_real_disconnect_after_tool_does_not_reexecute_tool(self):
         requests = []

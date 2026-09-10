@@ -8,11 +8,17 @@ prompt = "Construire une CLI Python de liste de tâches avec ajout, liste et sup
 base_url = "http://localhost:8000/v1"
 model = "your-tool-capable-model"
 api_key_env = "OPENAI_API_KEY"
+# OpenRouter endpoint (key read from OPENROUTER_API_KEY by default on this host):
+# base_url = "https://openrouter.ai/api/v1"
+# model = "anthropic/claude-sonnet-4"   # provider/model id, or "openrouter/auto"; must support tools
+# api_key_env = "OPENROUTER_API_KEY"
 # decision_model = "another-model"  # Same endpoint; defaults to model.
 # [llm.agent_models]
 # gsd-executor = "coding-model"
-# [llm.request_options]
-# max_tokens = 8192
+# [llm.headers]                        # Extra request headers; overrides the default
+# X-Title = "my-project"               # OpenRouter HTTP-Referer/X-Title attribution.
+# [llm.request_options]                # OpenRouter fields such as provider/transforms/
+# max_tokens = 8192                    # reasoning are accepted here too.
 
 [runtime]
 shell = "bash"

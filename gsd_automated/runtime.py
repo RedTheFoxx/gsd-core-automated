@@ -172,7 +172,8 @@ class Runtime:
     def process(self, argv, timeout=None, extra_env=None):
         env = os.environ.copy()
         # Keep API credentials out of child environments by default.
-        env.pop(self.cfg.api_key_env, None)
+        for name in {self.cfg.api_key_env, "OPENAI_API_KEY", "OPENROUTER_API_KEY"}:
+            env.pop(name, None)
         env.update({"CI": "1", "GIT_TERMINAL_PROMPT": "0", "GSD_JSON_ERRORS": "1",
                     "RUNTIME_DIR": str(self.root), "GSD_TOOLS": str(self.root / "gsd-core/bin/gsd-tools.cjs")})
         env.update(extra_env or {})

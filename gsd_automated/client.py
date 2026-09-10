@@ -16,6 +16,10 @@ class ContextWindowError(RunError):
     """The provider rejected input size; the host may compact and retry."""
 
 
+CONTEXT_MARKERS = ("context_length_exceeded", "maximum context length", "context window", "too many tokens", "prompt is too long")
+RETRIABLE_CODES = {"408", "429", "500", "502", "503", "504"}
+
+
 class Client:
     def __init__(self, config):
         self.config = config
@@ -29,7 +33,11 @@ class Client:
         payload = dict(cfg.request_options, model=model or cfg.model, messages=messages, stream=False)
         if tools:
             payload.update(tools=tools, tool_choice="auto")
-        headers = {"Content-Type": "application/json"}
+        headers = dict(cfg.headers)
+        if cfg.is_openrouter:
+            headers.setdefault("HTTP-Referer", "https://github.com/open-gsd/gsd-core")
+            headers.setdefault("X-Title", "gsd-automated")
+        headers["Content-Type"] = "application/json"
         key = os.getenv(cfg.api_key_env, "")
         if key:
             headers["Authorization"] = f"Bearer {key}"
@@ -46,25 +54,37 @@ class Client:
             try:
                 with urllib.request.urlopen(request, timeout=min(cfg.timeout, max(0.1, deadline - time.monotonic()))) as response:
                     data = json.load(response)
-                choice = data["choices"][0]
-                if choice.get("finish_reason") in {"length", "content_filter"}:
-                    raise RunError(f"Incomplete model response: {choice['finish_reason']}")
-                message = choice["message"]
-                if message.get("role") != "assistant":
-                    raise RunError("Endpoint returned a non-assistant message")
-                if attempt:
-                    self.on_event("connection_restored", attempts=attempt + 1)
-                return {k: v for k, v in message.items() if k in {"role", "content", "tool_calls", "reasoning_content"} and v is not None}
+                # OpenRouter can relay an upstream provider failure inside an
+                # HTTP 200 body; classify it exactly like a transport error.
+                fault = data.get("error") if isinstance(data, dict) else None
+                if isinstance(fault, dict) and not data.get("choices"):
+                    detail = json.dumps(fault).lower()
+                    if any(marker in detail for marker in CONTEXT_MARKERS):
+                        raise ContextWindowError("Provider context window exceeded") from None
+                    if str(fault.get("code")) not in RETRIABLE_CODES:
+                        raise RunError(f"Model endpoint returned an error: {fault.get('message') or fault}")
+                    reason, retry_after = f"provider error {fault.get('code')}", None
+                else:
+                    choice = data["choices"][0]
+                    if choice.get("finish_reason") in {"length", "content_filter"}:
+                        raise RunError(f"Incomplete model response: {choice['finish_reason']}")
+                    message = choice["message"]
+                    if message.get("role") != "assistant":
+                        raise RunError("Endpoint returned a non-assistant message")
+                    if attempt:
+                        self.on_event("connection_restored", attempts=attempt + 1)
+                    # reasoning/reasoning_details must be echoed back for
+                    # OpenRouter reasoning models with tool calls.
+                    return {k: v for k, v in message.items() if k in {"role", "content", "tool_calls", "reasoning", "reasoning_content", "reasoning_details"} and v is not None}
             except urllib.error.HTTPError as exc:
                 try:
                     body = exc.read(16000).decode("utf-8", errors="replace").lower()
                 except (OSError, http.client.HTTPException):
                     body = ""
                 exc.close()
-                if exc.code in {400, 413, 422} and any(marker in body for marker in (
-                    "context_length_exceeded", "maximum context length", "context window", "too many tokens", "prompt is too long")):
+                if exc.code in {400, 413, 422} and any(marker in body for marker in CONTEXT_MARKERS):
                     raise ContextWindowError("Provider context window exceeded") from None
-                if exc.code not in {408, 429, 500, 502, 503, 504}:
+                if str(exc.code) not in RETRIABLE_CODES:
                     raise RunError(f"Model endpoint returned HTTP {exc.code}") from None
                 reason = f"HTTP {exc.code}"
                 retry_after = (exc.headers or {}).get("Retry-After")

@@ -25,6 +25,7 @@ class Config:
     decision_model: str = ""
     agent_models: dict = field(default_factory=dict)
     request_options: dict = field(default_factory=dict)
+    headers: dict = field(default_factory=dict)
     max_calls: int = 300
     max_steps: int = 100
     max_depth: int = 3
@@ -41,6 +42,11 @@ class Config:
     node: str = "node"
     allow_shell: bool = True
     verification_commands: list = field(default_factory=list)
+
+    @property
+    def is_openrouter(self):
+        host = urlparse(self.base_url).hostname or ""
+        return host == "openrouter.ai" or host.endswith(".openrouter.ai")
 
     @classmethod
     def load(cls, args):
@@ -68,20 +74,29 @@ class Config:
                 raise ValueError("Each answer rule needs non-empty contains and answer")
         llm = data.get("llm", {})
         runtime = data.get("runtime", {})
+        base_url = llm.get("base_url") or os.getenv("OPENAI_BASE_URL") or os.getenv("OPENROUTER_BASE_URL")
+        if not base_url:
+            base_url = "https://openrouter.ai/api/v1" if os.getenv("OPENROUTER_API_KEY") else "http://localhost:8000/v1"
         cfg = cls(
             workspace=location(args.workspace or data.get("workspace", ".")),
             gsd_root=location(args.gsd_root or data.get("gsd_root", str(Path(__file__).resolve().parent.parent))),
             prompt=prompt, rules=rules,
-            base_url=llm.get("base_url", os.getenv("OPENAI_BASE_URL", "http://localhost:8000/v1")),
-            model=llm.get("model", os.getenv("OPENAI_MODEL", "")),
+            base_url=base_url,
+            model=llm.get("model") or os.getenv("OPENAI_MODEL") or os.getenv("OPENROUTER_MODEL") or "",
             **{k: v for k, v in llm.items() if k not in {"model", "base_url"}},
             **runtime,
         )
         if not cfg.model:
-            raise ValueError("Set llm.model or OPENAI_MODEL")
+            raise ValueError("Set llm.model or OPENAI_MODEL/OPENROUTER_MODEL")
         parsed = urlparse(cfg.base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError("base_url must be an HTTP(S) API base URL without credentials/query")
+        # On the OpenRouter host the conventional credential wins unless an
+        # explicit api_key_env or an existing OPENAI_API_KEY says otherwise.
+        if "api_key_env" not in llm and cfg.is_openrouter and (os.getenv("OPENROUTER_API_KEY") or not os.getenv("OPENAI_API_KEY")):
+            cfg.api_key_env = "OPENROUTER_API_KEY"
+        if not isinstance(cfg.headers, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in cfg.headers.items()):
+            raise ValueError("headers must be a string-to-string table")
         for key in ("max_calls", "max_steps", "max_depth", "max_context_chars", "timeout", "command_timeout", "reconnect_attempts", "reconnect_timeout"):
             if type(getattr(cfg, key)) is not int or getattr(cfg, key) < 1:
                 raise ValueError(f"{key} must be a positive integer")
