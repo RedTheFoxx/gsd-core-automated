@@ -1,5 +1,8 @@
 # GSD automatisé depuis Python
 
+Pour le principe de fonctionnement et les diagrammes d'architecture, voir
+[AUTOMATION-ARCHITECTURE.md](AUTOMATION-ARCHITECTURE.md).
+
 Ce wrapper est un **hôte GSD autonome**, indépendant de Kilo, Cline et Claude Code.
 Il lit les commandes dans `commands/gsd`, charge leurs `execution_context`, suit
 les workflows de `gsd-core/workflows`, charge les agents dans `agents`, et exécute
@@ -73,6 +76,17 @@ accepte les champs OpenRouter (`provider` pour le routage, `transforms`,
 requête suivante, exigence des modèles à raisonnement avec appels d'outils.
 Une erreur fournisseur relayée dans un corps HTTP 200 suit la même
 classification qu'une erreur de transport (réessai, compaction ou arrêt).
+Une réponse tronquée (`finish_reason: "length"`) est réémise avec un
+`max_tokens` doublé (jusqu'à 131072, trois essais) au lieu d'arrêter le run.
+
+## Suivi console
+
+Chaque événement est aussi affiché en direct sur stderr : sessions et
+sous-agents, appels d'outils avec un aperçu des arguments, résumés de résultats,
+décisions du représentant, tokens consommés par appel (`USAGE`, total cumulé),
+reconnexions, compactions et revue finale. `runtime.console = false` ou
+`--quiet` désactive cet affichage ; `events.jsonl` reste complet dans tous les
+cas.
 
 ## Exécution et décisions
 
