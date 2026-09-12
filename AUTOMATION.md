@@ -77,7 +77,16 @@ requête suivante, exigence des modèles à raisonnement avec appels d'outils.
 Une erreur fournisseur relayée dans un corps HTTP 200 suit la même
 classification qu'une erreur de transport (réessai, compaction ou arrêt).
 Une réponse tronquée (`finish_reason: "length"`) est réémise avec un
-`max_tokens` doublé (jusqu'à 131072, trois essais) au lieu d'arrêter le run.
+budget de sortie doublé (jusqu'à `max_output_tokens`, 32768 par défaut,
+trois escalades). `max_completion_tokens` est également respecté. Au plafond,
+la réponse partielle est écartée et le modèle reçoit une consigne de découpage
+en appels plus petits ; aucun outil partiel n'est exécuté. Les résumés ne sont
+jamais réémis pour une sortie tronquée.
+Une complétion vide (ni contenu ni outil — hoquet du fournisseur) est réémise
+jusqu'à trois fois ; ensuite le tour vide est écarté de l'historique : à la
+racine le modèle est relancé par un message de continuation, et un sous-agent
+retourne `{"error": ...}` au parent qui peut réessayer ou faire la tâche
+lui-même, sans interrompre le run.
 
 ## Suivi console
 
@@ -102,7 +111,8 @@ reste complet dans tous les cas.
 5. Une réponse libre du LLM hôte est aussi transmise au représentant : elle ne
    termine jamais implicitement la tâche. Les sous-agents doivent utiliser
    `AskUserQuestion` pour leurs questions et retourner leur résultat en texte.
-6. `Finish` déclenche les commandes d'acceptation configurées et une revue LLM
+6. `Finish` refuse les preuves constituées uniquement de planning/traces ou de
+   fichiers vides, puis déclenche les commandes d'acceptation configurées et une revue LLM
    distincte du besoin et des preuves lues sur disque. Les échecs retournent au
    LLM hôte pour correction. La revue est une appréciation LLM, pas une preuve
    formelle : fournir des commandes d'acceptation pour les critères mesurables.
@@ -137,32 +147,43 @@ scripts déjà terminés, ni les sous-agents déjà revenus, ni les contrôles
 d'acceptation déjà exécutés avant cet appel. Les sous-agents, le représentant,
 le résumeur et le réviseur bénéficient du même mécanisme.
 
-Avant un appel LLM, le wrapper vérifie la taille du contexte et des définitions
-d'outils. À 80 % de `max_context_chars`, il résume les tours anciens avec le modèle
-du rôle courant et vise 50 % du budget. Les paramètres sont
-`compact_trigger_ratio` et `compact_target_ratio`. Il conserve les instructions
-système, un résumé de travail (tâche, décisions, actions effectuées, fichiers,
-tests, questions et prochaines étapes) et les échanges récents complets.
-Un appel d'outil et ses résultats ne sont jamais séparés. Le programme continue
-ensuite automatiquement, sans réinitialiser ses budgets ni sa pile de sous-agents.
+Avant un appel LLM, l'hôte calcule le budget utilisable à partir de
+`context_window_tokens` (256000 par défaut), de la réserve `max_output_tokens`
+(32768) et des définitions d'outils. Il conserve une marge de 10 % et commence
+avec une estimation prudente de 0,5 token par caractère sérialisé. Les usages
+réels du fournisseur peuvent augmenter ce ratio, avec une marge supplémentaire
+de 20 %. `max_context_chars` reste un plafond indépendant pour limiter le coût.
+L'estimation ne remplace pas le tokenizer du fournisseur : un refus de contexte
+entraîne une réduction supplémentaire, mémorisée pour les prochains appels du
+modèle et sauvegardée pour la reprise. Utiliser la plus petite fenêtre des
+modèles routés dans une configuration commune.
 
-La mesure est en **caractères**, avec une marge configurable, pas en tokens :
-elle reste indépendante du tokenizer du fournisseur. Si celui-ci refuse malgré
-tout le contexte (`context_length_exceeded` ou message reconnu équivalent), le
-wrapper compacte davantage et réessaie jusqu'à trois fois. Les longs historiques
-sont résumés par fragments. Les appels de résumé utilisent les mêmes budgets
-et la même reconnexion. Un résumé trop long est d'abord re-compressé par le
-modèle, puis tronqué en conservant début (tâche, décisions) et fin (prochaine
-étape) avec un marqueur vers l'archive : jamais d'arrêt pour un dépassement de
-longueur. Une compaction impossible (instructions immuables trop longues,
-résumé vide ou invalide) provoque une erreur explicite ; elle ne détruit pas
-l'historique initial. La qualité du résumé dépend du modèle.
+À 80 % du budget effectif (`compact_trigger_ratio`), la compaction vise au plus
+50 % (`compact_target_ratio`). Elle archive l'intégralité de l'historique, garde
+les messages système et les tours récents complets, puis produit **un seul résumé**
+d'un condensé de 32000 caractères maximum. Les raisonnements anciens restent
+dans l'archive ; les échanges récents gardent leurs champs de raisonnement et
+leurs paires appels/résultats intactes. La sortie du résumé est bornée par
+`summary_max_tokens = 2048` et `summary_max_chars = 6000`. Il n'y a ni boucle de
+résumés par fragments, ni appel de réparation d'un résumé trop long.
 
-Avant chaque requête, un checkpoint `session-<id>.json` est écrit atomiquement
-dans le répertoire de l'exécution. Avant chaque compaction, le contexte complet
-est conservé dans `context-<id>.json`. L'agent reçoit le chemin de cette archive
-pour retrouver les détails nécessaires. Ces fichiers peuvent contenir du code
-et des données du projet, comme la trace.
+Un résumé vide, tronqué, trop long ou indisponible utilise des extraits archivés
+comme solution de repli. La requête de résumé utilise une fenêtre de reconnexion
+limitée à 60 secondes, sous réserve du délai de lecture réseau en cours. Les
+instructions immuables impossibles à faire tenir restent une erreur explicite.
+La compaction reste une opération avec perte : le modèle doit consulter les
+fichiers GSD ou l'archive pour retrouver un détail omis. L'affectation initiale
+complète est aussi conservée dans `assignment-*.json`, référencée par le système.
+
+La console distingue `COMPACT START`, `COMPACT`, `COMPACT FALLBACK` et
+`USAGE[summary]`. `CONTEXT` affiche le budget courant ; `cumulative` est la somme
+des tokens facturés sur les appels du lancement, **pas la taille du contexte**.
+
+Un checkpoint atomique `checkpoint.json` sauvegarde la pile des sessions, les
+réponses modèle, les outils en attente et les résultats terminés. Il est écrit
+avant chaque effet d'outil et après chaque résultat. `session-*.json` reste un
+instantané des requêtes ; `context-*.json` conserve l'historique avant compaction.
+Ces fichiers peuvent contenir du code et des données du projet, comme la trace.
 
 ## Outils et portée de cette version
 
@@ -205,12 +226,50 @@ gsd-auto --config examples/automation/config.toml --resume
 python -m unittest discover -s tests_python -v
 ```
 
-La reprise après arrêt du programme crée une nouvelle conversation à partir des
-fichiers GSD, des décisions enregistrées et des chemins des checkpoints du dernier
-run correspondant au même besoin. Elle n'est pas une reprise exacte de pile ni une garantie
-« exactement une fois » pour les commandes interrompues. Le LLM doit examiner
-les modifications partielles avant de réessayer. Conserver le même besoin et les
-mêmes règles pour une reprise cohérente.
+`--resume` restaure la pile des sessions du dernier run correspondant exactement
+au besoin initial, jusqu'au sous-agent interrompu. Les résultats d'outils déjà
+checkpointés sont conservés ; un sous-agent terminé n'est pas réexécuté. Le
+nouveau lancement a ses propres budgets de consommation (`max_calls` et
+`max_steps`) et son propre répertoire de trace ; il conserve les règles et les
+décisions. Des règles différentes provoquent une erreur explicite.
+
+Pour les anciennes traces sans `checkpoint.json`, la reprise reconstruit les
+sessions depuis `session-*.json` et les événements postérieurs aux instantanés.
+Le mode est nommé `legacy_reconstructed` dans le log. Les anciennes traces sans
+historique exploitable utilisent encore les fichiers GSD et les décisions ;
+le log affiche alors zéro session restaurée. Sans run correspondant au besoin,
+`--resume` échoue explicitement. Un démarrage raté ne masque pas le dernier run
+exploitable.
+
+Si un outil avait commencé mais que son résultat n'est pas enregistré, son effet
+est **inconnu**. Le modèle reçoit ce statut et doit inspecter les fichiers avant
+une nouvelle action. L'hôte ne rejoue pas automatiquement une commande shell
+incertaine ni la suite de son lot. Il n'existe pas de garantie « exactement une
+fois » pour un effet externe interrompu entre son exécution et son checkpoint.
+
+Vérifier la reprise sans appeler le modèle ni modifier le projet :
+
+```sh
+gsd-auto --config config.toml --resume --check --prompt "Le besoin initial exact"
+```
+
+La sortie indique `source`, `mode`, les agents, le nombre de messages et les
+outils en attente. `RESUME` confirme ces informations au lancement ; `resume.json`
+conserve la provenance. Après un arrêt brutal, le verrou reste volontairement
+à vérifier avant suppression ; une erreur réseau gérée libère le verrou.
+
+Pour le projet local `dofus-stuff-machine`, placé à côté de ce dépôt, le profil
+`examples/automation/dofus-docs.toml` conserve le modèle, les règles existantes
+et le besoin exact. Il réserve une fenêtre de 256k, autorise jusqu'à 2000 appels
+et 500 étapes par session/lancement, et passe le timeout réseau à 600 secondes
+avec une fenêtre de reconnexion de 1800 secondes. Ces plafonds limitent la
+consommation ; ils ne garantissent pas qu'un besoin arbitraire tient dedans.
+Depuis `gsd-core-automated` :
+
+```powershell
+uv run python -m gsd_automated --config examples/automation/dofus-docs.toml --resume --check
+uv run python -m gsd_automated --config examples/automation/dofus-docs.toml --resume
+```
 
 Codes de sortie : `0` livraison acceptée (ou contrôle local réussi), `1` erreur
 technique/budget, `2` blocage déclaré, `130` interruption clavier. `--check` ne
@@ -238,3 +297,15 @@ La compilation complète de GSD et la suite de tests ont réussi sous Windows.
 Aucun parcours avec un vrai LLM n'a été effectué : la qualité du suivi autonome
 de toutes les phases et la compatibilité d'un fournisseur particulier restent
 à valider sur le modèle choisi.
+
+Les tests de reprise lancent deux processus CLI successifs contre un endpoint
+simulé : écriture d'un guide français, arrêt après cette écriture, inspection
+`--resume --check`, reprise du sous-agent sans rejouer l'écriture, commande
+d'acceptation Node réelle et livraison acceptée. D'autres tests couvrent les
+lots d'outils partiellement terminés, les effets incertains, le résultat d'un
+sous-agent non encore transmis au parent et la migration des anciennes traces.
+Le log et les sorties des sous-processus Python utilisent UTF-8 sous Windows.
+
+La validation locale n'exécute pas le modèle OpenRouter réel : elle prouve les
+mécanismes de l'hôte, pas la qualité de la documentation finale ni la disponibilité
+continue du fournisseur. Le run documentaire reste à relancer par l'utilisateur.

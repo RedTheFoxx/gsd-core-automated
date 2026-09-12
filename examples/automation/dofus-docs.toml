@@ -1,0 +1,43 @@
+# Profil de reprise du run documentaire existant, sans modifier sa configuration.
+# Depuis gsd-core-automated :
+# uv run python -m gsd_automated --config examples/automation/dofus-docs.toml --resume --check
+# uv run python -m gsd_automated --config examples/automation/dofus-docs.toml --resume
+workspace = "../../../dofus-stuff-machine"
+gsd_root = "../.."
+rules_file = "../../../dofus-stuff-machine/gsd-auto-rules.toml"
+prompt = "Réalise une documentation user-friendly du projet en Français"
+
+[llm]
+base_url = "https://openrouter.ai/api/v1"
+model = "deepseek/deepseek-v4.1-flash"
+api_key_env = "OPENROUTER_API_KEY"
+
+[llm.headers]
+X-Title = "dofus-stuff-machine"
+
+[llm.request_options]
+max_tokens = 16384
+
+[runtime]
+shell = "C:/Program Files/Git/bin/bash.exe"
+node = "node"
+allow_shell = true
+# Plafonds par lancement, partagés entre les rôles pour max_calls.
+# Ce sont des limites de consommation, pas une cible à atteindre.
+max_calls = 2000
+max_steps = 500
+max_depth = 3
+context_window_tokens = 1048576
+max_output_tokens = 32768
+max_context_chars = 1200000
+compact_trigger_ratio = 0.8
+compact_target_ratio = 0.5
+summary_max_tokens = 2048
+summary_max_chars = 6000
+reconnect_attempts = 30
+reconnect_timeout = 1800
+retry_initial_delay = 1
+retry_max_delay = 30
+timeout = 600
+command_timeout = 600
+verification_commands = [".venv/Scripts/python.exe -m pytest -q"]

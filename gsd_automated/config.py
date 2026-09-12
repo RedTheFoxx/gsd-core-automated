@@ -26,10 +26,14 @@ class Config:
     agent_models: dict = field(default_factory=dict)
     request_options: dict = field(default_factory=dict)
     headers: dict = field(default_factory=dict)
-    max_calls: int = 300
-    max_steps: int = 100
+    max_calls: int = 2000
+    max_steps: int = 500
     max_depth: int = 3
-    max_context_chars: int = 300000
+    max_context_chars: int = 768000
+    context_window_tokens: int = 256000
+    max_output_tokens: int = 32768
+    summary_max_tokens: int = 2048
+    summary_max_chars: int = 6000
     compact_trigger_ratio: float = 0.8
     compact_target_ratio: float = 0.5
     reconnect_attempts: int = 30
@@ -98,11 +102,17 @@ class Config:
             cfg.api_key_env = "OPENROUTER_API_KEY"
         if not isinstance(cfg.headers, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in cfg.headers.items()):
             raise ValueError("headers must be a string-to-string table")
-        for key in ("max_calls", "max_steps", "max_depth", "max_context_chars", "timeout", "command_timeout", "reconnect_attempts", "reconnect_timeout"):
+        for key in ("max_calls", "max_steps", "max_depth", "max_context_chars", "context_window_tokens", "max_output_tokens", "summary_max_tokens", "summary_max_chars", "timeout", "command_timeout", "reconnect_attempts", "reconnect_timeout"):
             if type(getattr(cfg, key)) is not int or getattr(cfg, key) < 1:
                 raise ValueError(f"{key} must be a positive integer")
         if not 0 < cfg.compact_target_ratio < cfg.compact_trigger_ratio < 1:
             raise ValueError("Require 0 < compact_target_ratio < compact_trigger_ratio < 1")
+        if cfg.max_output_tokens >= cfg.context_window_tokens:
+            raise ValueError("max_output_tokens must be smaller than context_window_tokens")
+        for key in ("max_tokens", "max_completion_tokens"):
+            value = cfg.request_options.get(key)
+            if value is not None and (type(value) is not int or value < 1):
+                raise ValueError(f"request_options.{key} must be a positive integer")
         if not 0 < cfg.retry_initial_delay <= cfg.retry_max_delay:
             raise ValueError("Require 0 < retry_initial_delay <= retry_max_delay")
         if {"messages", "tools", "model", "stream", "tool_choice"} & cfg.request_options.keys():

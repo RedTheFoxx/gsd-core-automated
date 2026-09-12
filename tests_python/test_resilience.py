@@ -137,6 +137,19 @@ class TransportTests(Fixture):
         self.assertIn("response_truncated", events)
         self.assertEqual(events.count("model_usage"), 3)
 
+    def test_empty_completion_retried_then_surfaced(self):
+        def empty():
+            return io.BytesIO(json.dumps({"choices": [{"message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}]}).encode())
+        events = []
+        client = Client(self.cfg)
+        client.on_event = lambda event, **data: events.append(event)
+        with patch("urllib.request.urlopen", side_effect=[empty(), empty(), empty(), empty()]), patch("time.sleep"):
+            result = client.complete([say("hi")])
+        self.assertEqual(result.get("content"), "")
+        self.assertEqual(events.count("empty_response"), 3)
+        with patch("urllib.request.urlopen", side_effect=[empty(), self.success()]), patch("time.sleep"):
+            self.assertEqual(Client(self.cfg).complete([say("hi")])["content"], "recovered")
+
     def test_heartbeat_reports_waiting_calls(self):
         def urlopen(request, **kwargs):
             threading.Event().wait(0.05)
@@ -310,31 +323,23 @@ class CompactionTests(Fixture):
         self.assertEqual(model.generations, 2)
         self.assertLess(size(messages), 12000)
 
-    def test_oversized_summary_is_repaired_or_trimmed_not_fatal(self):
-        oversized = say("Task preserved. " + "detail " * 3000)  # ~21k chars > summary_limit
-        repaired = say("Task and decisions preserved. Next: implement.")
-        # Two chunks: normal merge, then oversized -> repaired by one model pass.
-        runtime = self.runtime(say("Chunk one summarized."), oversized, repaired)
+    def test_oversized_summary_is_trimmed_without_another_model_call(self):
+        runtime = self.runtime(say("Task preserved. " + "detail " * 3000))
         messages = self.history()
-        runtime.compactor.compact(messages, 30000, "test-model")
-        self.assertLess(size(messages), 30000)
-        self.assertIn("Task and decisions preserved", messages[1]["content"])
-        # A doubly-oversized reply falls back to a head/tail trim, never fatal.
-        runtime = self.runtime(say("Chunk one summarized."), oversized, oversized)
-        messages = self.history()
-        runtime.compactor.compact(messages, 30000, "test-model")
-        self.assertLess(size(messages), 30000)
-        self.assertIn("characters trimmed", messages[1]["content"])
-        self.assertLess(len(messages[1]["content"]), 16000)
+        runtime.compactor.compact(messages, 9000, "test-model")
+        self.assertLess(size(messages), 9000)
+        self.assertIn("omitted; consult archive", messages[1]["content"])
+        self.assertEqual(len(runtime.client.requests), 1)
 
-    def test_failed_summary_leaves_original_intact(self):
+    def test_failed_summary_uses_archived_excerpts_and_preserves_original_on_disk(self):
         runtime = self.runtime(say(""))
         messages = self.history()
         original = json.loads(json.dumps(messages))
-        with self.assertRaisesRegex(RunError, "non-empty"):
-            runtime.compactor.compact(messages, 9000, "test-model")
-        self.assertEqual(messages, original)
-        self.assertTrue(list(runtime.log_dir.glob("context-*.json")))
+        runtime.compactor.compact(messages, 9000, "test-model")
+        self.assertIn("Summary unavailable", messages[1]["content"])
+        self.assertLess(size(messages), 9000)
+        archive = next(runtime.log_dir.glob("context-*.json"))
+        self.assertEqual(json.loads(archive.read_text())["messages"], original)
 
     def test_pending_tool_round_cannot_be_compacted(self):
         runtime = self.runtime()

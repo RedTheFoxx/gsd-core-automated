@@ -11,8 +11,9 @@ import time
 import uuid
 from pathlib import Path
 
-from .client import ContextWindowError, RunError
+from .client import ContextWindowError, OutputLimitError, RunError
 from .context import Compactor, size
+from .checkpoint import find_resume
 
 
 def schema(name, description, properties, required=()):
@@ -49,6 +50,9 @@ available from the provided agents directory even if a Claude installation probe
 says they are missing. This host provides full tools and synchronous nested agents.
 Parallel waves run sequentially, preserving barriers and avoiding concurrent writes.
 Use GSD(args) for gsd_run commands whenever possible; it invokes the real Node CLI.
+Keep tool calls small: write large documents section by section with Write/Edit.
+Read long files with offset/limit; do not repeatedly reread whole unchanged files.
+Persist decisions, progress and next steps in GSD files before changing phases.
 Do not run interactive programs. Bash calls use a fresh shell; combine dependent
 commands or persist data in files. Framework home references map to GSD_ROOT.
 Use the configured model: ignore Claude-specific model names from GSD resolvers;
@@ -84,6 +88,16 @@ class Runtime:
         self.compactor = Compactor(client, self.archive_context, self.emit)
         self.agents = {}
         self.tokens = 0
+        self.frames = []
+        self.context_caps = {}
+
+    def save_state(self):
+        return self.snapshot("checkpoint.json", {
+            "version": 1, "run_id": self.run_id, "workspace": str(self.workspace),
+            "initial_need": self.cfg.prompt, "rules": self.cfg.rules,
+            "frames": self.frames, "decisions": self.decisions,
+            "context_caps": self.context_caps, "token_ratios": getattr(self.client, "token_ratios", {}),
+            "calls": getattr(self.client, "calls", 0), "tokens": self.tokens})
 
     def report(self, event, **data):
         """Live console overlay: one line per event, stderr so stdout stays JSON."""
@@ -104,9 +118,11 @@ class Runtime:
             self.tokens += (data.get("prompt_tokens") or 0) + (data.get("completion_tokens") or 0)
             if data.get("prompt_tokens") is None and data.get("completion_tokens") is None:
                 return
-            line = f"USAGE in={data.get('prompt_tokens')} out={data.get('completion_tokens')} total={self.tokens}"
+            line = f"USAGE[{data.get('purpose', 'work')}] in={data.get('prompt_tokens')} out={data.get('completion_tokens')} cumulative={self.tokens}"
         elif event == "model_waiting":
             line = f"WAIT {data.get('model')} {data.get('seconds')}s in flight (req {data.get('chars', 0) // 1000}k chars)"
+        elif event == "empty_response":
+            line = "EMPTY completion; resending the same request"
         elif event == "tool_start":
             line = f"-> {data.get('name')} {data.get('preview', '')}"
         elif event == "tool_result":
@@ -121,6 +137,14 @@ class Runtime:
             line = f"TRUNCATED output; retrying with max_tokens={data.get('max_tokens')}"
         elif event == "context_compacted":
             line = f"COMPACT {data.get('before_chars')}->{data.get('after_chars')} chars"
+        elif event == "context_compaction_start":
+            line = f"COMPACT START {data.get('before_chars')} chars; target={data.get('target_chars')}"
+        elif event == "context_summary_fallback":
+            line = "COMPACT FALLBACK archived excerpts: " + cut(data.get("reason"))
+        elif event == "resume_loaded":
+            line = f"RESUME {data.get('mode')} from={data.get('source')} sessions={data.get('sessions')} active={data.get('active')}"
+        elif event == "context_budget":
+            line = f"CONTEXT {data.get('chars')}/{data.get('budget_chars')} chars; window={self.cfg.context_window_tokens} tokens; output reserve={self.cfg.max_output_tokens}"
         elif event == "context_summary_trimmed":
             line = f"SUMMARY TRIMMED {data.get('before_chars')}->{data.get('after_chars')} chars"
         elif event == "completion_review":
@@ -192,8 +216,13 @@ class Runtime:
         self.snapshot(f"session-{session}.json", {"messages": messages, "model": model, "phase": "before_compaction"})
         tool_chars = len(json.dumps(tools, ensure_ascii=False)) if tools else 0
         budget = cfg.max_context_chars - tool_chars
+        if hasattr(self.client, "message_budget"):
+            budget = min(budget, self.client.message_budget(tools, model))
+        budget = min(budget, self.context_caps.get(model, budget))
+        self.emit("context_budget", session=session, chars=size(messages), budget_chars=budget)
         if size(messages) >= budget * cfg.compact_trigger_ratio:
             self.compactor.compact(messages, int(budget * cfg.compact_target_ratio), model)
+            self.save_state()
         # Different compatible providers have different tokenizers/windows. If
         # the local estimate misses, reduce adaptively, without executing tools.
         for attempt in range(4):
@@ -203,7 +232,10 @@ class Runtime:
             except ContextWindowError:
                 if attempt == 3:
                     raise RunError("Provider still rejects context after automatic compaction") from None
-                self.compactor.compact(messages, int(size(messages) * cfg.compact_target_ratio), model)
+                target = int(size(messages) * cfg.compact_target_ratio)
+                self.context_caps[model] = int(target / cfg.compact_trigger_ratio)
+                self.compactor.compact(messages, target, model)
+                self.save_state()
 
     def emit(self, event, **data):
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -261,6 +293,7 @@ class Runtime:
         for name in {self.cfg.api_key_env, "OPENAI_API_KEY", "OPENROUTER_API_KEY"}:
             env.pop(name, None)
         env.update({"CI": "1", "GIT_TERMINAL_PROMPT": "0", "GSD_JSON_ERRORS": "1",
+                    "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1",
                     "RUNTIME_DIR": str(self.root), "GSD_TOOLS": str(self.root / "gsd-core/bin/gsd-tools.cjs")})
         env.update(extra_env or {})
         with tempfile.TemporaryFile() as out:
@@ -421,6 +454,8 @@ class Runtime:
             if not p.is_file() or not p.is_relative_to(self.workspace):
                 return {"error": f"Missing project evidence: {raw}"}
             evidence.append({"path": raw, "content": p.read_text(encoding="utf-8", errors="replace")[:30000]})
+        if not any(e["content"].strip() and self.path(e["path"]).relative_to(self.workspace).parts[0] not in {".planning", ".gsd-auto"} for e in evidence):
+            return {"error": "Planning or trace files alone are not delivery. Supply actual non-empty product/documentation files."}
         checks = [self.bash(command) for command in self.cfg.verification_commands]
         if any(c["exit_code"] != 0 or c["timed_out"] for c in checks):
             return {"error": "Acceptance commands failed", "checks": checks}
@@ -439,55 +474,111 @@ class Runtime:
         return {"status": "complete", "summary": args["summary"], "review": verdict}
 
     def session(self, task, depth=0, agent="root"):
-        sid = uuid.uuid4().hex
         cfg = self.cfg
-        system = HOST + f"\nROLE: {agent}; DEPTH: {depth}\nWORKSPACE: {self.workspace}\nGSD_ROOT: {self.root}\nSHELL: {cfg.shell}\nINITIAL NEED: {cfg.prompt}\nRULES: {cfg.rules['instructions']}"
-        messages = [{"role": "system", "content": system}, {"role": "user", "content": task}]
+        if len(self.frames) > depth:
+            frame = self.frames[depth]
+            agent = frame["agent"]
+        else:
+            system = HOST + f"\nROLE: {agent}; DEPTH: {depth}\nWORKSPACE: {self.workspace}\nGSD_ROOT: {self.root}\nSHELL: {cfg.shell}\nINITIAL NEED: {cfg.prompt}\nRULES: {cfg.rules['instructions']}"
+            assignment = self.snapshot(f"assignment-{uuid.uuid4().hex}.json", {"task": task})
+            system += f"\nFull assigned task and role instructions (read when context is compacted): {assignment}"
+            frame = {"sid": uuid.uuid4().hex, "agent": agent, "depth": depth,
+                     "messages": [{"role": "system", "content": system}, {"role": "user", "content": task}],
+                     "pending": [], "executing": False}
+            self.frames.append(frame)
+        sid, messages = frame["sid"], frame["messages"]
         available = TOOLS if depth == 0 else [t for t in TOOLS if t["function"]["name"] != "Finish"]
         self.emit("session_start", session=sid, agent=agent, depth=depth)
-        for _ in range(cfg.max_steps):
-            message = self.complete(messages, available, cfg.agent_models.get(agent, cfg.model), session=sid)
-            self.emit("assistant", session=sid, message=message)
-            messages.append(message)
-            calls = message.get("tool_calls", [])
-            if not calls:
-                if depth:
-                    if not message.get("content"):
-                        raise RunError("Subagent returned an empty result")
-                    return {"agent": agent, "result": message["content"]}
-                answers = self.decide([{"question": message.get("content", "Continue toward the initial need")}], json.dumps(messages[-8:]))
-                messages.append({"role": "user", "content": json.dumps(answers, ensure_ascii=False) + "\nContinue executing. Use Finish only when done or blocked."})
-                continue
-            if not isinstance(calls, list):
-                raise RunError("Invalid tool_calls response")
-            seen = set()
-            for call in calls:
-                if not isinstance(call, dict) or not call.get("id") or call["id"] in seen or call.get("type") != "function" or not isinstance(call.get("function"), dict):
-                    raise RunError("Invalid/duplicate tool call envelope")
-                seen.add(call["id"])
-            for call in calls:
+        self.save_state()
+        if "result" in frame:
+            if depth == 0:
+                self.snapshot("result.json", frame["result"])
+                self.emit("run_end", **frame["result"])
+            return frame["result"]
+        # Only persisted child sessions are safe to resume inside an interrupted tool.
+        # An arbitrary shell command may have committed an effect before the crash.
+        if frame.get("executing") and not (frame["pending"] and frame["pending"][0]["function"]["name"] == "Agent" and len(self.frames) > depth + 1):
+            for call in frame["pending"]:
+                messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps({
+                    "error": "Interrupted tool round: effect unknown or call not started. Inspect files/state before retrying; do not assume completion.",
+                    "recovery": "not_replayed", "tool": call["function"]["name"]})})
+            frame.update(pending=[], executing=False)
+            self.save_state()
+        steps = 0
+        while steps < cfg.max_steps:
+            if not frame["pending"]:
+                steps += 1
+                try:
+                    message = self.complete(messages, available, cfg.agent_models.get(agent, cfg.model), session=sid)
+                except OutputLimitError:
+                    messages.append({"role": "user", "content": "Your response exceeded the output budget and was discarded; NO tool in it ran. Continue with smaller tool calls, one document section at a time. Use Edit to extend existing files."})
+                    self.save_state()
+                    continue
+                calls = message.get("tool_calls") or []
+                if not isinstance(calls, list):
+                    raise RunError("Invalid tool_calls response")
+                seen = set()
+                for call in calls:
+                    if not isinstance(call, dict) or not call.get("id") or call["id"] in seen or call.get("type") != "function" or not isinstance(call.get("function"), dict):
+                        raise RunError("Invalid/duplicate tool call envelope")
+                    seen.add(call["id"])
+                self.emit("assistant", session=sid, message=message)
+                if not calls and not message.get("content"):
+                    if depth:
+                        frame["result"] = {"agent": agent, "error": "Model returned empty responses; retry the agent or perform its task inline"}
+                        self.save_state()
+                        return frame["result"]
+                    messages.append({"role": "user", "content": "Your previous response was empty. Continue executing toward the initial need; use tools, or Finish when done."})
+                    self.save_state()
+                    continue
+                messages.append(message)
+                frame["pending"] = list(calls)
+                self.save_state()  # Persist the complete response BEFORE any tool effect.
+                if not calls:
+                    if depth:
+                        frame["result"] = {"agent": agent, "result": message["content"]}
+                        self.save_state()
+                        return frame["result"]
+                    answers = self.decide([{"question": message.get("content", "Continue toward the initial need")}], json.dumps(messages[-8:]))
+                    messages.append({"role": "user", "content": json.dumps(answers, ensure_ascii=False) + "\nContinue executing. Use Finish only when done or blocked."})
+                    self.save_state()
+                    continue
+            while frame["pending"]:
+                call = frame["pending"][0]
                 name = call["function"].get("name")
+                frame["executing"] = True
+                self.save_state()
                 self.emit("tool_start", session=sid, name=name, call_id=call["id"], preview=self._preview(name, call["function"].get("arguments", "")))
+                terminal = False
                 try:
                     args = json.loads(call["function"].get("arguments", ""))
                     if not isinstance(args, dict):
                         raise ValueError("Tool arguments must be an object")
                     if name == "Finish" and depth == 0:
-                        if len(calls) != 1:
+                        # Finish must have been the ONLY call in the original round.
+                        last_assistant = next(m for m in reversed(messages) if m["role"] == "assistant")
+                        if len(last_assistant.get("tool_calls", [])) != 1:
                             result = {"error": "Call Finish alone after all other tools have returned"}
                         else:
                             result = self.completion(args)
-                            if result.get("status"):
-                                self.emit("run_end", **result)
-                                (self.log_dir / "result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-                                return result
+                            terminal = bool(result.get("status"))
                     else:
                         result = self.dispatch(name, args, depth, messages)
                 except (OSError, ValueError, KeyError, TypeError) as exc:
                     result = {"error": f"{type(exc).__name__}: {exc}"}
-                self.emit("tool_result", session=sid, name=name, call_id=call["id"], result=result)
                 messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(result, ensure_ascii=False)})
-        raise RunError(f"Step budget exhausted in {agent}")
+                frame["pending"].pop(0)
+                frame["executing"] = False
+                if terminal:
+                    frame["result"] = result
+                del self.frames[depth + 1:]
+                self.save_state()  # Completed tools are durable, including the last in a batch.
+                self.emit("tool_result", session=sid, name=name, call_id=call["id"], result=result)
+                if terminal:
+                    self.emit("run_end", **result)
+                    self.snapshot("result.json", result)
+                    return result
+        raise RunError(f"Step budget exhausted in {agent}; checkpoint saved for --resume")
 
     def run(self, resume=False):
         # Atomic lock; do not automatically steal stale locks after a crash.
@@ -511,23 +602,24 @@ class Runtime:
         self.preflight()
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.emit("run_start", initial_need=self.cfg.prompt, resume=resume)
-        prior = []
         previous_contexts = []
         if resume:
-            for path in sorted((self.workspace / ".gsd-auto").glob("*/events.jsonl"), key=lambda p: p.stat().st_mtime):
-                same_need = False
-                for line in path.read_text(encoding="utf-8").splitlines():
-                    try:
-                        record = json.loads(line)
-                        if record.get("event") == "run_start":
-                            same_need = record.get("initial_need") == self.cfg.prompt
-                        if same_need and record.get("event") == "decision":
-                            prior.append({k: record[k] for k in ["question", "answer", "source"]})
-                    except (ValueError, KeyError):
-                        continue
-                if same_need and path.parent != self.log_dir:
-                    previous_contexts = sorted(str(p) for p in path.parent.glob("session-*.json"))
-            self.decisions = prior
+            recovered = find_resume(self.workspace, self.cfg.prompt, self.cfg.rules, self.log_dir)
+            self.decisions = recovered.get("decisions", [])
+            self.frames = recovered.get("frames", [])
+            self.context_caps = recovered.get("context_caps", {})
+            if hasattr(self.client, "token_ratios"):
+                self.client.token_ratios.update(recovered.get("token_ratios", {}))
+            previous_contexts = recovered.get("contexts", [])
+            self.emit("resume_loaded", mode=recovered["mode"], source=recovered["source"],
+                      sessions=len(self.frames), active=self.frames[-1]["agent"] if self.frames else "files")
+            self.snapshot("resume.json", {k: recovered[k] for k in ("source", "mode")})
+            if self.frames:
+                # A blocked result may be revisited after the user resolved its cause.
+                if self.frames[0].get("result", {}).get("status") == "blocked":
+                    self.frames[0].pop("result")
+                    self.frames[0]["messages"].append({"role": "user", "content": "The user requested resume. Reassess the blocker from current files and continue the initial need."})
+                return self.session("")
         planning = self.workspace / ".planning"
         command = "progress" if (planning / "ROADMAP.md").exists() else "new-project"
         instructions = []

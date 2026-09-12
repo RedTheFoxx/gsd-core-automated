@@ -87,6 +87,19 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue((self.workspace / "foo.py").is_file())
         self.assertIn("Implemented foo.py", runtime.client.requests[3]["messages"][-1]["content"])
 
+    def test_subagent_empty_result_returns_error_not_crash(self):
+        runtime = self.runtime(say(""))
+        result = runtime.session("task", depth=1, agent="gsd-planner")
+        self.assertIn("error", result)
+        self.assertEqual(result["agent"], "gsd-planner")
+
+    def test_root_empty_response_gets_continuation_nudge(self):
+        runtime = self.runtime(say(""), tool("Finish", {"status": "blocked", "summary": "done", "evidence": []}))
+        self.assertEqual(runtime.session("start")["status"], "blocked")
+        nudge = runtime.client.requests[1]["messages"][-1]
+        self.assertEqual(nudge["role"], "user")
+        self.assertIn("empty", nudge["content"].lower())
+
     def test_depth_limit_returns_actionable_error(self):
         runtime = self.runtime()
         result = runtime.dispatch("Agent", {"agent_type": "gsd-executor", "prompt": "task"}, self.cfg.max_depth, [])

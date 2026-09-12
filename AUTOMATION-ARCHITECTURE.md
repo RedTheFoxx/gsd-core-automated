@@ -82,14 +82,13 @@ flowchart LR
 3. **Preflight** : le workspace existe, le corpus GSD contient les fichiers
    requis, `node`, le shell et `git` sont présents, `gsd-tools.cjs
    runtime-identity` répond, le shell exécute `gsd_run`.
-4. **Reprise éventuelle** (`--resume`) : les décisions des runs précédents
-   portant le même besoin sont rechargées depuis `events.jsonl`, et les chemins
-   des checkpoints `session-*.json` sont fournis au LLM comme données
-   historiques — jamais comme commandes à rejouer.
-5. **Choix du point d'entrée** : `progress` si `.planning/ROADMAP.md` existe,
-   sinon `new-project`. Le contenu de la commande, ses `execution_context` et
-   les instructions projet (`AGENTS.md`, `CLAUDE.md`) composent la tâche
-   initiale.
+4. **Reprise éventuelle** (`--resume`) : `checkpoint.py` charge la pile des sessions,
+   les décisions et les résultats d'outils persistés. Les anciennes traces sont
+   reconstruites depuis les instantanés et les événements. Un effet interrompu
+   sans résultat est signalé comme inconnu, sans rejeu automatique. Le contrôle
+   `--resume --check` expose la source et les sessions sans appel LLM.
+5. **Point d'entrée d'un nouveau run** : `progress` si `.planning/ROADMAP.md`
+   existe, sinon `new-project`. Une reprise restaurée repart du sous-agent actif.
 6. **Session racine** : boucle outil/appel jusqu'à `Finish`, blocage ou
    épuisement des budgets.
 
@@ -142,16 +141,17 @@ sequenceDiagram
         RT->>RT: snapshot session-xxx.json
         opt contexte ≥ trigger
             RT->>CX: compact(messages, cible)
-            CX->>LLM: résumé par fragments
+            CX->>LLM: un résumé borné du condensé archivé
             CX-->>RT: pinned + mémoire + queue récente
         end
         RT->>LLM: complete(messages, tools)
         LLM-->>RT: message assistant
         alt tool_calls présents
             loop pour chaque appel
+                RT->>RT: checkpoint réponse + outil en cours
                 RT->>FS: dispatch(nom, args)
                 FS-->>RT: résultat ou erreur
-                RT->>RT: empile message "tool"
+                RT->>RT: empile résultat tool + checkpoint de la pile
             end
         else pas de tool_calls
             alt session racine
@@ -240,16 +240,18 @@ Un même endpoint peut héberger plusieurs rôles, chacun configurable :
   respecté, plafonds `reconnect_attempts` (30) et `reconnect_timeout` (900 s).
   401/403 et réponses invalides arrêtent le run. Le transport non-streaming
   garantit qu'aucune réponse tronquée n'exécute un outil.
-- **Fenêtre de contexte** (`context.py`) : mesure en caractères, indépendante
-  du tokenizer. À `compact_trigger_ratio` (80 %) du budget, les tours anciens
-  sont archivés dans `context-*.json` puis résumés par fragments en un handoff
-  borné ; le contexte reconstruit garde les messages système, la mémoire
-  résumée et les tours récents entiers — un appel d'outil n'est jamais séparé
-  de son résultat. Si le fournisseur refuse malgré tout
-  (`context_length_exceeded`), compaction supplémentaire et 3 réessais.
-- **Traçabilité** : `events.jsonl` (décisions, outils, compactions, revues),
-  `session-*.json` avant chaque appel, `result.json` final. La clé API est
-  masquée dans les journaux et retirée de l'environnement des sous-processus.
+- **Fenêtre de contexte** (`context.py`) : le budget tient compte de la fenêtre
+  en tokens, de la réserve de sortie, des outils et des usages réels du modèle.
+  Le plafond caractères reste applicable. À 80 %, l'hôte archive le contexte et
+  effectue un seul résumé borné d'un condensé de 32000 caractères maximum. Un
+  échec du résumé utilise des extraits avec références à l'archive. Le système
+  et les tours récents entiers restent intacts, y compris le raisonnement récent.
+  Les refus fournisseur réduisent durablement le budget effectif du modèle.
+- **Traçabilité** : `events.jsonl`, `checkpoint.json` après chaque transition,
+  `session-*.json` avant chaque appel, `assignment-*.json`, `context-*.json`,
+  `resume.json` et `result.json`. La clé API est masquée dans les journaux et
+  retirée de l'environnement des sous-processus. Le compteur cumulé de tokens
+  représente la consommation, pas l'occupation de la fenêtre de contexte.
 
 ## Ce que fait le LLM à l'intérieur de la boucle
 
@@ -272,8 +274,8 @@ flowchart LR
 
 Chaque étape est une `SlashCommand` dont le document charge à son tour
 workflows, références et templates. L'état persistant vit dans `.planning/` et
-est manipulé par le vrai `gsd-tools.cjs` : si le processus Python est relancé,
-`progress` retrouve la roadmap et reprend le routage.
+est manipulé par le vrai `gsd-tools.cjs`. La pile de sessions est persistée
+séparément par l’hôte ; `--resume` la restaure avant de poursuivre ce routage.
 
 ## Limites assumées
 
